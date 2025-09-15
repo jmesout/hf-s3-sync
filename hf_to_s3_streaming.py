@@ -138,16 +138,18 @@ class StreamingUploader:
         safe_log('info', f"Simple upload: {file_info.path}")
         response = requests.get(file_info.url, headers=self.headers, stream=True)
         response.raise_for_status()
-        
-        class ProgressCallbackWrapper:
-            def __init__(self, file, callback): self._file = file; self._callback = callback
-            def read(self, size=-1):
-                data = self._file.read(size)
-                if data: self._callback(len(data))
-                return data
-        
-        body = ProgressCallbackWrapper(response.raw, progress_callback)
-        self.s3_client.upload_fileobj(body, self.bucket, s3_key)
+
+        # Read all content for simple uploads
+        content = response.content
+        progress_callback(len(content))
+
+        # Upload with explicit ContentType and unsigned payload for Ceph
+        self.s3_client.put_object(
+            Bucket=self.bucket,
+            Key=s3_key,
+            Body=content,
+            ContentType='application/octet-stream'
+        )
         safe_log('info', f"✓ Uploaded: {s3_key}")
         return True, "uploaded successfully"
 
@@ -208,7 +210,7 @@ def get_s3_client():
     safe_log('info', f"Connecting to S3-compatible storage at: {endpoint_url}")
     safe_log('info', f"Configuration: signature={signature_version}, path_style={use_path_style}, verify_ssl={verify_ssl}")
 
-    # Configure boto3 for S3-compatible storage (Civo)
+    # Configure boto3 for S3-compatible storage (Civo/Ceph)
     # Path-style addressing is required for most S3-compatible services
     config = Config(
         region_name=AWS_REGION,
@@ -217,7 +219,7 @@ def get_s3_client():
         max_pool_connections=50,
         s3={
             'addressing_style': 'path',  # Force path style addressing
-            'payload_signing_enabled': True
+            'payload_signing_enabled': False  # Disable for Ceph/Civo compatibility
         }
     )
 
