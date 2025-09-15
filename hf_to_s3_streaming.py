@@ -174,17 +174,28 @@ class StreamingUploader:
             raise
 
 def get_s3_client():
+    # Get signature version from environment or default to s3v4
+    signature_version = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
+    # Get path style configuration
+    use_path_style = os.getenv("USE_PATH_STYLE", "true").lower() == "true"
+    # Get SSL verification setting
+    verify_ssl = os.getenv("VERIFY_SSL", "true").lower() == "true"
+
     config = Config(
-        region_name=AWS_REGION, signature_version='s3',
-        retries={'max_attempts': 5, 'mode': 'adaptive'}, max_pool_connections=50
+        region_name=AWS_REGION,
+        signature_version=signature_version,
+        s3={'addressing_style': 'path' if use_path_style else 'virtual'},
+        retries={'max_attempts': 5, 'mode': 'adaptive'},
+        max_pool_connections=50
     )
     endpoint_url = AWS_HOST
     if not AWS_HOST.startswith('http'):
         endpoint_url = f"https://{AWS_HOST}"
     safe_log('info', f"Connecting to S3-compatible storage at: {endpoint_url}")
+    safe_log('info', f"Using signature version: {signature_version}, path style: {use_path_style}, verify SSL: {verify_ssl}")
     return boto3.client(
         's3', endpoint_url=endpoint_url, aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY, config=config, verify=False
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY, config=config, verify=verify_ssl
     )
 
 def detect_resources():
