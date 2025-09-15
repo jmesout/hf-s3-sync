@@ -219,7 +219,8 @@ def get_s3_client():
         region_name=AWS_REGION
     )
 
-    # Test connection
+    # Test connection - but don't fail if list_buckets doesn't work
+    # Some S3-compatible services don't support list_buckets
     try:
         response = client.list_buckets()
         safe_log('info', f"Successfully connected to S3-compatible storage. Found {len(response.get('Buckets', []))} buckets")
@@ -229,11 +230,13 @@ def get_s3_client():
             safe_log('warning', f"Target bucket '{S3_BUCKET}' not found in available buckets: {bucket_names}")
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        safe_log('error', f"Failed to connect to S3: {error_code} - {e}")
-        raise
+        if error_code == 'AccessDenied':
+            safe_log('warning', f"Cannot list buckets (AccessDenied) - will attempt to use bucket '{S3_BUCKET}' directly")
+        else:
+            safe_log('warning', f"Connection test warning: {error_code} - {e}")
+            # Don't raise - try to continue anyway
     except Exception as e:
-        safe_log('error', f"Connection test failed: {e}")
-        raise
+        safe_log('warning', f"Connection test warning: {e} - continuing anyway")
 
     return client
 
@@ -291,9 +294,12 @@ def stream_all_files(model_id: str, token: str, max_workers: int):
     api = HfApi()
     s3_client = get_s3_client()
     uploader = StreamingUploader(s3_client, S3_BUCKET, token)
-    
+
     file_infos = get_file_info_list(api, model_id, token)
-    if not file_infos: return
+    if not file_infos:
+        safe_log('warning', "No files found to process - exiting")
+        return
+    safe_log('info', f"Found {len(file_infos)} files to process after filtering")
 
     files_to_download = []
     total_download_size = 0
@@ -305,24 +311,27 @@ def stream_all_files(model_id: str, token: str, max_workers: int):
             try:
                 s3_key = f"{S3_PREFIX}/{file_info.path}"
                 s3_info = uploader.check_file_exists(s3_key)
-                should_download, _ = uploader.should_download_file(file_info, s3_info)
+                should_download, reason = uploader.should_download_file(file_info, s3_info)
                 if should_download:
                     files_to_download.append(file_info)
                     total_download_size += file_info.size
+                    safe_log('debug', f"Will download {file_info.path}: {reason}")
             except (BotoCoreError, ClientError) as e:
                 safe_log('warning', f"Pre-flight check failed for {file_info.path}: {e}. Assuming it needs download.")
                 files_to_download.append(file_info)
                 total_download_size += file_info.size
     else:
-        safe_log('info', "Skipping existence check, assuming all files need to be downloaded...")
+        safe_log('info', f"Skipping existence check (SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}), assuming all files need to be downloaded...")
         files_to_download = file_infos
         total_download_size = sum(f.size for f in file_infos)
+        safe_log('info', f"Will download all {len(files_to_download)} files")
     
     if not files_to_download:
         safe_log('info', "All files are already up to date in S3. Nothing to do.")
         return
 
     safe_log('info', f"Need to download {len(files_to_download)} files ({total_download_size / (1024**3):.2f} GB)")
+    safe_log('info', f"Starting parallel download with {max_workers} workers...")
 
     progress_tracker = ProgressTracker(total_size=total_download_size)
     stop_monitor, completed_files, failed_files = threading.Event(), [], []
