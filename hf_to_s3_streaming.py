@@ -50,7 +50,8 @@ STREAM_CHUNK_SIZE = 10 * 1024 * 1024
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 VERIFY_SIZE = True
-FORCE_REDOWNLOAD = False
+# This will be set from environment variable below
+FORCE_REDOWNLOAD = None
 
 # Environment variables
 model_id = os.getenv("MODEL_ID")
@@ -63,6 +64,9 @@ S3_PREFIX = "-".join((model_id.split("/")[1]).split("-")[:3]) if model_id else "
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 # --- NEW FEATURE: Add environment variable to skip the existence check ---
 SKIP_EXISTENCE_CHECK = os.getenv("SKIP_EXISTENCE_CHECK", "false").lower() == "true"
+FORCE_REDOWNLOAD = os.getenv("FORCE_REDOWNLOAD", "false").lower() == "true"
+
+safe_log('info', f"Environment flags: SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}, FORCE_REDOWNLOAD={FORCE_REDOWNLOAD}")
 
 # File patterns to skip for vLLM
 SKIP_PATTERNS = [
@@ -83,10 +87,14 @@ class StreamingUploader:
 
     def check_file_exists(self, s3_key: str):
         try:
-            return self.s3_client.head_object(Bucket=self.bucket, Key=s3_key)
+            response = self.s3_client.head_object(Bucket=self.bucket, Key=s3_key)
+            return response
         except ClientError as e:
-            if e.response['Error']['Code'] == '404':
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == '404' or error_code == 'NoSuchKey':
                 return None
+            # Log the actual error for debugging
+            safe_log('debug', f"HeadObject error for {s3_key}: {error_code} - {e}")
             raise
 
     def should_download_file(self, file_info: FileInfo, s3_info) -> Tuple[bool, str]:
@@ -174,29 +182,60 @@ class StreamingUploader:
             raise
 
 def get_s3_client():
-    # Get signature version from environment or default to s3v4
+    # Get configuration from environment
     signature_version = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
-    # Get path style configuration
-    use_path_style = os.getenv("USE_PATH_STYLE", "true").lower() == "true"
-    # Get SSL verification setting
     verify_ssl = os.getenv("VERIFY_SSL", "true").lower() == "true"
+    use_path_style = os.getenv("USE_PATH_STYLE", "true").lower() == "true"
 
-    config = Config(
-        region_name=AWS_REGION,
-        signature_version=signature_version,
-        s3={'addressing_style': 'path' if use_path_style else 'virtual'},
-        retries={'max_attempts': 5, 'mode': 'adaptive'},
-        max_pool_connections=50
-    )
+    # Build endpoint URL
     endpoint_url = AWS_HOST
     if not AWS_HOST.startswith('http'):
         endpoint_url = f"https://{AWS_HOST}"
+
     safe_log('info', f"Connecting to S3-compatible storage at: {endpoint_url}")
-    safe_log('info', f"Using signature version: {signature_version}, path style: {use_path_style}, verify SSL: {verify_ssl}")
-    return boto3.client(
-        's3', endpoint_url=endpoint_url, aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY, config=config, verify=verify_ssl
+    safe_log('info', f"Configuration: signature={signature_version}, path_style={use_path_style}, verify_ssl={verify_ssl}")
+
+    # Configure boto3 for S3-compatible storage (Civo)
+    # Path-style addressing is required for most S3-compatible services
+    config = Config(
+        region_name=AWS_REGION,
+        signature_version=signature_version,
+        retries={'max_attempts': 5, 'mode': 'adaptive'},
+        max_pool_connections=50,
+        s3={
+            'addressing_style': 'path',  # Force path style addressing
+            'payload_signing_enabled': True
+        }
     )
+
+    # Create S3 client
+    client = boto3.client(
+        's3',
+        endpoint_url=endpoint_url,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        config=config,
+        verify=verify_ssl,
+        region_name=AWS_REGION
+    )
+
+    # Test connection
+    try:
+        response = client.list_buckets()
+        safe_log('info', f"Successfully connected to S3-compatible storage. Found {len(response.get('Buckets', []))} buckets")
+        # Verify our target bucket exists
+        bucket_names = [b['Name'] for b in response.get('Buckets', [])]
+        if S3_BUCKET not in bucket_names:
+            safe_log('warning', f"Target bucket '{S3_BUCKET}' not found in available buckets: {bucket_names}")
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        safe_log('error', f"Failed to connect to S3: {error_code} - {e}")
+        raise
+    except Exception as e:
+        safe_log('error', f"Connection test failed: {e}")
+        raise
+
+    return client
 
 def detect_resources():
     cpu_count = os.cpu_count() or 1
