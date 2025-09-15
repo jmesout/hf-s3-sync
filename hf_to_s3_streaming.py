@@ -60,13 +60,20 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_HOST = os.getenv("AWS_HOST")
 S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = "-".join((model_id.split("/")[1]).split("-")[:3]) if model_id else ""
+# Extract prefix from model_id - handle both org/model and simple model formats
+if model_id and "/" in model_id:
+    # Format: org/model-name -> extract model-name and take first 3 parts
+    model_name = model_id.split("/")[1]
+    S3_PREFIX = "-".join(model_name.split("-")[:3])
+elif model_id:
+    # Simple format without org
+    S3_PREFIX = "-".join(model_id.split("-")[:3])
+else:
+    S3_PREFIX = ""
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 # --- NEW FEATURE: Add environment variable to skip the existence check ---
 SKIP_EXISTENCE_CHECK = os.getenv("SKIP_EXISTENCE_CHECK", "false").lower() == "true"
 FORCE_REDOWNLOAD = os.getenv("FORCE_REDOWNLOAD", "false").lower() == "true"
-
-safe_log('info', f"Environment flags: SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}, FORCE_REDOWNLOAD={FORCE_REDOWNLOAD}")
 
 # File patterns to skip for vLLM
 SKIP_PATTERNS = [
@@ -373,10 +380,18 @@ def stream_all_files(model_id: str, token: str, max_workers: int):
             safe_log('error', f"  - {path}: {msg}")
 
 if __name__ == "__main__":
+    # Log environment configuration
+    safe_log('info', f"Environment flags: SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}, FORCE_REDOWNLOAD={FORCE_REDOWNLOAD}")
+    safe_log('info', f"Model: {model_id}, Bucket: {S3_BUCKET}, Prefix: {S3_PREFIX}")
+
     if not all([model_id, huggingface_token, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_HOST, S3_BUCKET]):
         logging.error("Missing required environment variables.")
+        logging.error(f"model_id={model_id}, HF_TOKEN={'set' if huggingface_token else 'missing'}")
+        logging.error(f"AWS_ACCESS_KEY_ID={'set' if AWS_ACCESS_KEY_ID else 'missing'}")
+        logging.error(f"AWS_SECRET_ACCESS_KEY={'set' if AWS_SECRET_ACCESS_KEY else 'missing'}")
+        logging.error(f"AWS_HOST={AWS_HOST}, S3_BUCKET={S3_BUCKET}")
         exit(1)
-    
+
     max_workers = detect_resources()
     
     try:
@@ -387,5 +402,8 @@ if __name__ == "__main__":
         safe_log('info', "Process interrupted by user.")
     except Exception as e:
         safe_log('error', f"A fatal error occurred: {e}")
-    
+        import traceback
+        safe_log('error', f"Traceback: {traceback.format_exc()}")
+        exit(1)  # Exit with error code
+
     safe_log('info', "Transfer complete!")
