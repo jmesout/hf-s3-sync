@@ -219,7 +219,7 @@ def get_s3_client():
         max_pool_connections=50,
         s3={
             'addressing_style': 'path',  # Force path style addressing
-            'payload_signing_enabled': False  # Disable for Ceph/Civo compatibility
+            'payload_signing_enabled': True  # Disable for Ceph/Civo compatibility
         }
     )
 
