@@ -488,7 +488,7 @@ def get_s3_client():
     # Configure for S3-compatible storage (Ceph)
     config = Config(
         region_name=AWS_REGION,
-        signature_version='s3v4',
+        signature_version='s3',
         retries={
             'max_attempts': 3,
             'mode': 'standard'
