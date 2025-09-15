@@ -74,6 +74,8 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 # --- NEW FEATURE: Add environment variable to skip the existence check ---
 SKIP_EXISTENCE_CHECK = os.getenv("SKIP_EXISTENCE_CHECK", "false").lower() == "true"
 FORCE_REDOWNLOAD = os.getenv("FORCE_REDOWNLOAD", "false").lower() == "true"
+# Skip permission tests for Ceph/Civo compatible endpoints
+SKIP_PERMISSION_TEST = os.getenv("SKIP_PERMISSION_TEST", "false").lower() == "true"
 
 # File patterns to skip for vLLM
 SKIP_PATTERNS = [
@@ -100,7 +102,11 @@ class StreamingUploader:
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
             if error_code == '404' or error_code == 'NoSuchKey':
                 return None
-            # Log the actual error for debugging
+            # For Ceph/Civo, AccessDenied might mean the object doesn't exist
+            if error_code in ['AccessDenied', 'Forbidden']:
+                safe_log('debug', f"HeadObject returned {error_code} for {s3_key} - treating as not found")
+                return None
+            # Log other errors for debugging
             safe_log('debug', f"HeadObject error for {s3_key}: {error_code} - {e}")
             raise
 
@@ -226,24 +232,107 @@ def get_s3_client():
         region_name=AWS_REGION
     )
 
-    # Test connection - but don't fail if list_buckets doesn't work
-    # Some S3-compatible services don't support list_buckets
-    try:
-        response = client.list_buckets()
-        safe_log('info', f"Successfully connected to S3-compatible storage. Found {len(response.get('Buckets', []))} buckets")
-        # Verify our target bucket exists
-        bucket_names = [b['Name'] for b in response.get('Buckets', [])]
-        if S3_BUCKET not in bucket_names:
-            safe_log('warning', f"Target bucket '{S3_BUCKET}' not found in available buckets: {bucket_names}")
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        if error_code == 'AccessDenied':
-            safe_log('warning', f"Cannot list buckets (AccessDenied) - will attempt to use bucket '{S3_BUCKET}' directly")
+    # For Ceph/Civo compatibility, skip tests that require ListBuckets permission
+    if not SKIP_PERMISSION_TEST:
+        try:
+            # Try to list buckets (may fail with restricted permissions)
+            response = client.list_buckets()
+            safe_log('info', f"Successfully connected to S3-compatible storage. Found {len(response.get('Buckets', []))} buckets")
+            bucket_names = [b['Name'] for b in response.get('Buckets', [])]
+            if S3_BUCKET not in bucket_names:
+                safe_log('warning', f"Target bucket '{S3_BUCKET}' not found in available buckets: {bucket_names}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code in ['AccessDenied', 'Forbidden']:
+                safe_log('info', f"Cannot list buckets (restricted endpoint) - using bucket '{S3_BUCKET}' directly")
+            else:
+                safe_log('warning', f"Connection test warning: {error_code} - {e}")
+        except Exception as e:
+            safe_log('warning', f"Connection test warning: {e} - continuing anyway")
+
+        # Test the actual S3 operations we need for streaming uploads
+        safe_log('info', "Testing required S3 operations...")
+        test_key = f"{S3_PREFIX}/.permission_test_{int(time.time())}"
+        operations_ok = True
+
+        # Test 1: Simple PutObject for small files
+        try:
+            client.put_object(
+                Bucket=S3_BUCKET,
+                Key=test_key,
+                Body=b"test",
+                ContentType="text/plain"
+            )
+            safe_log('info', "✓ PutObject operation works")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            safe_log('error', f"✗ PutObject failed: {error_code} - {e}")
+            operations_ok = False
+
+        # Test 2: CreateMultipartUpload for large files
+        try:
+            mpu = client.create_multipart_upload(
+                Bucket=S3_BUCKET,
+                Key=test_key + "_multipart"
+            )
+            upload_id = mpu['UploadId']
+            safe_log('info', "✓ CreateMultipartUpload operation works")
+
+            # Test 3: UploadPart
+            try:
+                client.upload_part(
+                    Bucket=S3_BUCKET,
+                    Key=test_key + "_multipart",
+                    PartNumber=1,
+                    UploadId=upload_id,
+                    Body=b"test part"
+                )
+                safe_log('info', "✓ UploadPart operation works")
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                safe_log('error', f"✗ UploadPart failed: {error_code} - {e}")
+                operations_ok = False
+
+            # Clean up: abort the multipart upload
+            try:
+                client.abort_multipart_upload(
+                    Bucket=S3_BUCKET,
+                    Key=test_key + "_multipart",
+                    UploadId=upload_id
+                )
+            except:
+                pass  # Ignore cleanup errors
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            safe_log('error', f"✗ CreateMultipartUpload failed: {error_code} - {e}")
+            operations_ok = False
+
+        # Test 4: HeadObject (for checking file existence)
+        try:
+            client.head_object(Bucket=S3_BUCKET, Key=test_key)
+            safe_log('info', "✓ HeadObject operation works")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            # 404 is expected since we're testing with a non-existent key
+            if error_code not in ['404', 'NoSuchKey']:
+                safe_log('warning', f"⚠ HeadObject may have issues: {error_code}")
+
+        # Clean up test object
+        try:
+            client.delete_object(Bucket=S3_BUCKET, Key=test_key)
+        except:
+            pass  # Ignore cleanup errors
+
+        if not operations_ok:
+            safe_log('error', "CRITICAL: Required S3 operations are not working")
+            safe_log('error', "Please check your S3 credentials and bucket permissions")
+            raise Exception("S3 permission test failed")
         else:
-            safe_log('warning', f"Connection test warning: {error_code} - {e}")
-            # Don't raise - try to continue anyway
-    except Exception as e:
-        safe_log('warning', f"Connection test warning: {e} - continuing anyway")
+            safe_log('info', "All required S3 operations verified successfully")
+    else:
+        safe_log('info', "Skipping permission tests (SKIP_PERMISSION_TEST=true) - assuming bucket is accessible")
+        safe_log('info', f"Will use bucket '{S3_BUCKET}' with prefix '{S3_PREFIX}'")
 
     return client
 
