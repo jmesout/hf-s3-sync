@@ -1,14 +1,25 @@
+#!/usr/bin/env python3
+"""
+HuggingFace to S3 Streaming v2
+Optimized for Ceph/Rados Gateway with techniques from s3-benchmark
+Auto-scales based on available memory and CPU
+Uses temporary storage instead of persistent volumes
+"""
+
 import logging
 import os
+import sys
 import time
-import json
+import tempfile
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError, BotoCoreError
 import requests
@@ -16,66 +27,72 @@ from requests.exceptions import RequestException
 from huggingface_hub import HfApi, login, hf_hub_url
 import psutil
 from tqdm import tqdm
-import urllib3
-from urllib3.exceptions import InsecureRequestWarning
-
-# Suppress only the single InsecureRequestWarning from urllib3.
-urllib3.disable_warnings(InsecureRequestWarning)
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(threadName)s] - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 log_lock = threading.Lock()
 
-def safe_log(level, message):
+def safe_log(level: str, message: str):
+    """Thread-safe logging"""
     with log_lock:
-        getattr(logging, level)(message)
+        getattr(logger, level)(message)
+
+@dataclass
+class SystemResources:
+    """System resource information for auto-scaling"""
+    cpu_cores: int
+    total_memory_gb: float
+    available_memory_gb: float
+    recommended_workers: int
+    chunk_size_mb: int
+    max_concurrency: int
+    multipart_threshold_mb: int
 
 @dataclass
 class ProgressTracker:
+    """Track download/upload progress"""
     total_size: int
     bytes_transferred: int = 0
-    lock: threading.Lock = threading.Lock()
-    start_time: float = time.time()
+    lock: threading.Lock = None
+    start_time: float = None
+
+    def __post_init__(self):
+        if self.lock is None:
+            self.lock = threading.Lock()
+        if self.start_time is None:
+            self.start_time = time.time()
+
     def update(self, chunk_size: int):
         with self.lock:
             self.bytes_transferred += chunk_size
 
-# Configuration
-MULTIPART_THRESHOLD = 100 * 1024 * 1024
-MULTIPART_CHUNKSIZE = 100 * 1024 * 1024
-STREAM_CHUNK_SIZE = 10 * 1024 * 1024
-MAX_RETRIES = 3
-RETRY_DELAY = 5
-VERIFY_SIZE = True
-# This will be set from environment variable below
-FORCE_REDOWNLOAD = None
+    def get_speed(self) -> float:
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            if elapsed > 0:
+                return self.bytes_transferred / elapsed
+            return 0
 
-# Environment variables
-model_id = os.getenv("MODEL_ID")
-huggingface_token = os.getenv("HF_TOKEN")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_HOST = os.getenv("AWS_HOST")
-S3_BUCKET = os.getenv("S3_BUCKET")
-# Extract prefix from model_id - handle both org/model and simple model formats
-if model_id and "/" in model_id:
-    # Format: org/model-name -> extract model-name and take first 3 parts
-    model_name = model_id.split("/")[1]
-    S3_PREFIX = "-".join(model_name.split("-")[:3])
-elif model_id:
-    # Simple format without org
-    S3_PREFIX = "-".join(model_id.split("-")[:3])
-else:
-    S3_PREFIX = ""
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-# --- NEW FEATURE: Add environment variable to skip the existence check ---
-SKIP_EXISTENCE_CHECK = os.getenv("SKIP_EXISTENCE_CHECK", "false").lower() == "true"
-FORCE_REDOWNLOAD = os.getenv("FORCE_REDOWNLOAD", "false").lower() == "true"
-# Skip permission tests for Ceph/Civo compatible endpoints
-SKIP_PERMISSION_TEST = os.getenv("SKIP_PERMISSION_TEST", "false").lower() == "true"
+@dataclass
+class FileInfo:
+    """Information about a file to transfer"""
+    path: str
+    size: int
+    url: str
+    sha256: Optional[str] = None
+
+# Hardcoded optimizations for Ceph/Rados Gateway
+CEPH_CONFIG = {
+    'signature_version': 's3v4',
+    'addressing_style': 'path',
+    'payload_signing_enabled': True,
+    'max_pool_connections': 100,
+    'retries': {'max_attempts': 3, 'mode': 'adaptive'},
+}
 
 # File patterns to skip for vLLM
 SKIP_PATTERNS = [
@@ -84,142 +101,104 @@ SKIP_PATTERNS = [
     "trainer_state.json", "training_args.bin", "README.md", ".gitattributes"
 ]
 
-@dataclass
-class FileInfo:
-    path: str; size: int; url: str; sha256: Optional[str] = None
+def detect_system_resources() -> SystemResources:
+    """
+    Detect system resources and calculate optimal settings.
+    Uses techniques from s3-benchmark for auto-scaling.
+    """
+    cpu_cores = os.cpu_count() or 1
+    memory = psutil.virtual_memory()
+    total_memory_gb = memory.total / (1024**3)
+    available_memory_gb = memory.available / (1024**3)
 
-class StreamingUploader:
-    def __init__(self, s3_client, bucket: str, token: str):
-        self.s3_client = s3_client
-        self.bucket = bucket
-        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # Calculate workers based on CPU and memory
+    # Reserve 20% memory for system
+    usable_memory_gb = available_memory_gb * 0.8
 
-    def check_file_exists(self, s3_key: str):
-        try:
-            response = self.s3_client.head_object(Bucket=self.bucket, Key=s3_key)
-            return response
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            if error_code == '404' or error_code == 'NoSuchKey':
-                return None
-            # For Ceph/Civo, AccessDenied might mean the object doesn't exist
-            if error_code in ['AccessDenied', 'Forbidden']:
-                safe_log('debug', f"HeadObject returned {error_code} for {s3_key} - treating as not found")
-                return None
-            # Log other errors for debugging
-            safe_log('debug', f"HeadObject error for {s3_key}: {error_code} - {e}")
-            raise
+    # Each worker should have at least 512MB
+    max_workers_by_memory = int(usable_memory_gb * 1024 / 512)
 
-    def should_download_file(self, file_info: FileInfo, s3_info) -> Tuple[bool, str]:
-        if FORCE_REDOWNLOAD: return True, "force redownload enabled"
-        if s3_info is None: return True, "file not found in S3"
-        s3_size = s3_info.get('ContentLength', 0)
-        if VERIFY_SIZE and s3_size != file_info.size:
-            safe_log('warning', f"Size mismatch for {file_info.path}: S3={s3_size}, HF={file_info.size}")
-            return True, f"size mismatch"
-        if s3_size == file_info.size: return False, f"already exists with correct size"
-        return True, "verification failed"
+    # Use 2-4 workers per CPU core for I/O bound tasks
+    max_workers_by_cpu = cpu_cores * 3
 
-    def stream_to_s3(self, file_info: FileInfo, s3_key: str, progress_callback: callable) -> Tuple[bool, str]:
-        for attempt in range(MAX_RETRIES):
-            try:
-                if file_info.size < MULTIPART_THRESHOLD:
-                    return self._simple_upload(file_info, s3_key, progress_callback)
-                else:
-                    return self._multipart_upload_with_resume(file_info, s3_key, progress_callback)
-            except (RequestException, BotoCoreError, ClientError) as e:
-                safe_log('warning', f"Attempt {attempt + 1}/{MAX_RETRIES} failed for {file_info.path}: {e}")
-                if attempt + 1 == MAX_RETRIES:
-                    return False, str(e)
-                time.sleep(RETRY_DELAY * (attempt + 1))
-        return False, "Exhausted all retries."
+    # Take the minimum and cap at 32
+    recommended_workers = min(max_workers_by_memory, max_workers_by_cpu, 32)
+    recommended_workers = max(1, recommended_workers)
 
-    def _simple_upload(self, file_info: FileInfo, s3_key: str, progress_callback: callable) -> Tuple[bool, str]:
-        safe_log('info', f"Simple upload: {file_info.path}")
-        response = requests.get(file_info.url, headers=self.headers, stream=True)
-        response.raise_for_status()
+    # Calculate chunk size based on available memory per worker
+    # Each worker gets equal share of usable memory
+    memory_per_worker_mb = int((usable_memory_gb * 1024) / recommended_workers)
 
-        # Read all content for simple uploads
-        content = response.content
-        progress_callback(len(content))
+    # Chunk size should be between 8MB and 128MB
+    chunk_size_mb = min(128, max(8, memory_per_worker_mb // 4))
 
-        # Upload with explicit ContentType and unsigned payload for Ceph
-        self.s3_client.put_object(
-            Bucket=self.bucket,
-            Key=s3_key,
-            Body=content,
-            ContentType='application/octet-stream'
-        )
-        safe_log('info', f"✓ Uploaded: {s3_key}")
-        return True, "uploaded successfully"
+    # Multipart threshold at 2x chunk size
+    multipart_threshold_mb = chunk_size_mb * 2
 
-    def _multipart_upload_with_resume(self, file_info: FileInfo, s3_key: str, progress_callback: callable) -> Tuple[bool, str]:
-        safe_log('info', f"Multipart upload: {file_info.path}")
-        mpu = self.s3_client.create_multipart_upload(Bucket=self.bucket, Key=s3_key)
-        upload_id = mpu['UploadId']
-        parts = []
+    # Max concurrency for transfers (similar to workers but can be higher for small files)
+    max_concurrency = min(recommended_workers * 2, 50)
 
-        try:
-            response = requests.get(file_info.url, headers=self.headers, stream=True)
-            response.raise_for_status()
-            
-            buffer, part_number = BytesIO(), 1
-            for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
-                if not chunk: continue
-                progress_callback(len(chunk))
-                buffer.write(chunk)
-                if buffer.tell() >= MULTIPART_CHUNKSIZE:
-                    buffer.seek(0)
-                    part_data = buffer.read(MULTIPART_CHUNKSIZE)
-                    part_resp = self.s3_client.upload_part(
-                        Body=part_data, Bucket=self.bucket, Key=s3_key,
-                        PartNumber=part_number, UploadId=upload_id)
-                    parts.append({'ETag': part_resp['ETag'], 'PartNumber': part_number})
-                    buffer = BytesIO(buffer.read())
-                    part_number += 1
-            
-            if buffer.tell() > 0:
-                buffer.seek(0)
-                part_resp = self.s3_client.upload_part(
-                    Body=buffer.read(), Bucket=self.bucket, Key=s3_key,
-                    PartNumber=part_number, UploadId=upload_id)
-                parts.append({'ETag': part_resp['ETag'], 'PartNumber': part_number})
+    safe_log('info', f"System Resources Detected:")
+    safe_log('info', f"  CPU Cores: {cpu_cores}")
+    safe_log('info', f"  Total Memory: {total_memory_gb:.2f} GB")
+    safe_log('info', f"  Available Memory: {available_memory_gb:.2f} GB")
+    safe_log('info', f"  Recommended Workers: {recommended_workers}")
+    safe_log('info', f"  Chunk Size: {chunk_size_mb} MB")
+    safe_log('info', f"  Multipart Threshold: {multipart_threshold_mb} MB")
+    safe_log('info', f"  Max Concurrency: {max_concurrency}")
 
-            self.s3_client.complete_multipart_upload(
-                Bucket=self.bucket, Key=s3_key, UploadId=upload_id,
-                MultipartUpload={'Parts': sorted(parts, key=lambda x: x['PartNumber'])}
-            )
-            safe_log('info', f"✓ Multipart upload complete: {s3_key}")
-            return True, "uploaded successfully"
-        except Exception as e:
-            safe_log('warning', f"Aborting multipart upload for {s3_key} due to error: {e}")
-            self.s3_client.abort_multipart_upload(Bucket=self.bucket, Key=s3_key, UploadId=upload_id)
-            raise
+    return SystemResources(
+        cpu_cores=cpu_cores,
+        total_memory_gb=total_memory_gb,
+        available_memory_gb=available_memory_gb,
+        recommended_workers=recommended_workers,
+        chunk_size_mb=chunk_size_mb,
+        max_concurrency=max_concurrency,
+        multipart_threshold_mb=multipart_threshold_mb
+    )
+
+def get_transfer_config(resources: SystemResources) -> TransferConfig:
+    """
+    Create optimized TransferConfig based on system resources.
+    Uses techniques from s3-benchmark.
+    """
+    return TransferConfig(
+        multipart_threshold=resources.multipart_threshold_mb * 1024 * 1024,
+        multipart_chunksize=resources.chunk_size_mb * 1024 * 1024,
+        max_concurrency=resources.max_concurrency,
+        use_threads=True,
+        max_io_queue=resources.max_concurrency * 2,
+    )
 
 def get_s3_client():
-    # Get configuration from environment
-    signature_version = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
-    verify_ssl = os.getenv("VERIFY_SSL", "true").lower() == "true"
-    use_path_style = os.getenv("USE_PATH_STYLE", "true").lower() == "true"
+    """
+    Create S3 client optimized for Ceph/Rados Gateway.
+    Configuration hardcoded for Ceph compatibility.
+    """
+    # Mandatory environment variables
+    aws_access_key = os.environ['AWS_ACCESS_KEY_ID']
+    aws_secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
+    aws_host = os.environ['AWS_HOST']
 
     # Build endpoint URL
-    endpoint_url = AWS_HOST
-    if not AWS_HOST.startswith('http'):
-        endpoint_url = f"https://{AWS_HOST}"
+    endpoint_url = aws_host
+    if not aws_host.startswith('http'):
+        endpoint_url = f"https://{aws_host}"
 
     safe_log('info', f"Connecting to S3-compatible storage at: {endpoint_url}")
-    safe_log('info', f"Configuration: signature={signature_version}, path_style={use_path_style}, verify_ssl={verify_ssl}")
 
-    # Configure boto3 for S3-compatible storage (Civo/Ceph)
-    # Path-style addressing is required for most S3-compatible services
+    # Get region from environment or default to us-east-1
+    region = os.getenv('AWS_REGION', 'us-east-1')
+
+    # Hardcoded Ceph-optimized configuration
     config = Config(
-        region_name=AWS_REGION,
-        signature_version=signature_version,
-        retries={'max_attempts': 5, 'mode': 'adaptive'},
-        max_pool_connections=50,
+        region_name=region,
+        signature_version=CEPH_CONFIG['signature_version'],
+        retries=CEPH_CONFIG['retries'],
+        max_pool_connections=CEPH_CONFIG['max_pool_connections'],
         s3={
-            'addressing_style': 'path',  # Force path style addressing
-            'payload_signing_enabled': True  # Disable for Ceph/Civo compatibility
+            'addressing_style': CEPH_CONFIG['addressing_style'],
+            'payload_signing_enabled': CEPH_CONFIG['payload_signing_enabled']
         }
     )
 
@@ -227,224 +206,282 @@ def get_s3_client():
     client = boto3.client(
         's3',
         endpoint_url=endpoint_url,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
         config=config,
-        verify=verify_ssl,
-        region_name=AWS_REGION
+        verify=False,  # Ceph often uses self-signed certs
+        region_name=region
     )
 
-    # For Ceph/Civo compatibility, skip tests that require ListBuckets permission
-    if not SKIP_PERMISSION_TEST:
+    # Quick connectivity test
+    bucket = os.environ['S3_BUCKET']
+    try:
+        client.head_bucket(Bucket=bucket)
+        safe_log('info', f"Successfully connected to bucket: {bucket}")
+    except ClientError as e:
+        # Ceph might not allow HeadBucket, try a simple list instead
         try:
-            # Try to list buckets (may fail with restricted permissions)
-            response = client.list_buckets()
-            safe_log('info', f"Successfully connected to S3-compatible storage. Found {len(response.get('Buckets', []))} buckets")
-            bucket_names = [b['Name'] for b in response.get('Buckets', [])]
-            if S3_BUCKET not in bucket_names:
-                safe_log('warning', f"Target bucket '{S3_BUCKET}' not found in available buckets: {bucket_names}")
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            if error_code in ['AccessDenied', 'Forbidden']:
-                safe_log('info', f"Cannot list buckets (restricted endpoint) - using bucket '{S3_BUCKET}' directly")
-            else:
-                safe_log('warning', f"Connection test warning: {error_code} - {e}")
-        except Exception as e:
-            safe_log('warning', f"Connection test warning: {e} - continuing anyway")
-
-        # Test the actual S3 operations we need for streaming uploads
-        safe_log('info', "Testing required S3 operations...")
-        test_key = f"{S3_PREFIX}/.permission_test_{int(time.time())}"
-        operations_ok = True
-
-        # Test 1: Simple PutObject for small files
-        try:
-            client.put_object(
-                Bucket=S3_BUCKET,
-                Key=test_key,
-                Body=b"test",
-                ContentType="text/plain"
-            )
-            safe_log('info', "✓ PutObject operation works")
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            safe_log('error', f"✗ PutObject failed: {error_code} - {e}")
-            operations_ok = False
-
-        # Test 2: CreateMultipartUpload for large files
-        try:
-            mpu = client.create_multipart_upload(
-                Bucket=S3_BUCKET,
-                Key=test_key + "_multipart"
-            )
-            upload_id = mpu['UploadId']
-            safe_log('info', "✓ CreateMultipartUpload operation works")
-
-            # Test 3: UploadPart
-            try:
-                client.upload_part(
-                    Bucket=S3_BUCKET,
-                    Key=test_key + "_multipart",
-                    PartNumber=1,
-                    UploadId=upload_id,
-                    Body=b"test part"
-                )
-                safe_log('info', "✓ UploadPart operation works")
-            except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-                safe_log('error', f"✗ UploadPart failed: {error_code} - {e}")
-                operations_ok = False
-
-            # Clean up: abort the multipart upload
-            try:
-                client.abort_multipart_upload(
-                    Bucket=S3_BUCKET,
-                    Key=test_key + "_multipart",
-                    UploadId=upload_id
-                )
-            except:
-                pass  # Ignore cleanup errors
-
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            safe_log('error', f"✗ CreateMultipartUpload failed: {error_code} - {e}")
-            operations_ok = False
-
-        # Test 4: HeadObject (for checking file existence)
-        try:
-            client.head_object(Bucket=S3_BUCKET, Key=test_key)
-            safe_log('info', "✓ HeadObject operation works")
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            # 404 is expected since we're testing with a non-existent key
-            if error_code not in ['404', 'NoSuchKey']:
-                safe_log('warning', f"⚠ HeadObject may have issues: {error_code}")
-
-        # Clean up test object
-        try:
-            client.delete_object(Bucket=S3_BUCKET, Key=test_key)
+            client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+            safe_log('info', f"Successfully connected to bucket: {bucket}")
         except:
-            pass  # Ignore cleanup errors
-
-        if not operations_ok:
-            safe_log('error', "CRITICAL: Required S3 operations are not working")
-            safe_log('error', "Please check your S3 credentials and bucket permissions")
-            raise Exception("S3 permission test failed")
-        else:
-            safe_log('info', "All required S3 operations verified successfully")
-    else:
-        safe_log('info', "Skipping permission tests (SKIP_PERMISSION_TEST=true) - assuming bucket is accessible")
-        safe_log('info', f"Will use bucket '{S3_BUCKET}' with prefix '{S3_PREFIX}'")
+            safe_log('warning', f"Could not verify bucket access: {e}")
 
     return client
 
-def detect_resources():
-    cpu_count = os.cpu_count() or 1
-    max_workers = max(1, min(cpu_count * 6, 32))
-    safe_log('info', f"Using {max_workers} parallel workers for streaming")
-    return max_workers
+class OptimizedUploader:
+    """
+    Optimized uploader using techniques from s3-benchmark.
+    Uses TransferConfig and temporary storage.
+    """
 
-def get_file_info_list(api: HfApi, model_id: str, token: str) -> List[FileInfo]:
+    def __init__(self, s3_client, bucket: str, prefix: str,
+                 transfer_config: TransferConfig, hf_token: str):
+        self.s3_client = s3_client
+        self.bucket = bucket
+        self.prefix = prefix
+        self.transfer_config = transfer_config
+        self.headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    def check_file_exists(self, s3_key: str) -> Optional[Dict]:
+        """Check if file exists in S3"""
+        try:
+            response = self.s3_client.head_object(Bucket=self.bucket, Key=s3_key)
+            return response
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            # Civo returns 403 for non-existent objects
+            if error_code in ['404', 'NoSuchKey', 'AccessDenied', 'Forbidden', '403']:
+                return None
+            safe_log('warning', f"Unexpected error checking {s3_key}: {error_code}")
+            raise
+
+    def upload_file_streaming(self, file_info: FileInfo, s3_key: str,
+                             progress_callback: callable) -> Tuple[bool, str]:
+        """
+        Stream upload with temporary storage and memory optimization.
+        Uses techniques from s3-benchmark for efficient transfers.
+        """
+        # Check if file already exists with correct size
+        s3_info = self.check_file_exists(s3_key)
+        if s3_info and s3_info.get('ContentLength') == file_info.size:
+            safe_log('info', f"Skipping {file_info.path}: already exists with correct size")
+            return True, "already exists"
+
+        safe_log('info', f"Uploading {file_info.path} ({file_info.size / (1024**2):.2f} MB)")
+
+        # Use temporary file for large files to avoid memory issues
+        use_temp_file = file_info.size > (self.transfer_config.multipart_threshold * 2)
+
+        try:
+            # Stream download from HuggingFace
+            response = requests.get(file_info.url, headers=self.headers, stream=True)
+            response.raise_for_status()
+
+            if use_temp_file:
+                # Use temporary file for large files
+                with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+                    # Stream to temporary file
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            temp_file.write(chunk)
+                            progress_callback(len(chunk))
+
+                    temp_file.flush()
+                    temp_file.seek(0)
+
+                    # Upload from temporary file using upload_file
+                    self.s3_client.upload_file(
+                        temp_file.name,
+                        self.bucket,
+                        s3_key,
+                        Config=self.transfer_config,
+                        Callback=progress_callback
+                    )
+            else:
+                # For smaller files, use memory buffer
+                buffer = BytesIO()
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        buffer.write(chunk)
+                        progress_callback(len(chunk))
+
+                buffer.seek(0)
+
+                # Upload from memory using put_object for small files
+                self.s3_client.put_object(
+                    Bucket=self.bucket,
+                    Key=s3_key,
+                    Body=buffer.getvalue()
+                )
+
+            safe_log('info', f"✓ Uploaded: {s3_key}")
+            return True, "uploaded successfully"
+
+        except Exception as e:
+            safe_log('error', f"Failed to upload {file_info.path}: {e}")
+            return False, str(e)
+
+def get_file_list(model_id: str, token: str) -> List[FileInfo]:
+    """Get list of files to transfer from HuggingFace"""
     from fnmatch import fnmatch
+
     safe_log('info', f"Fetching file list for {model_id}...")
-    repo_info = api.repo_info(repo_id=model_id, token=token, files_metadata=True)
+    api = HfApi()
+
+    try:
+        repo_info = api.repo_info(repo_id=model_id, token=token, files_metadata=True)
+    except Exception as e:
+        safe_log('error', f"Failed to get repo info: {e}")
+        raise
+
     all_files = [
         FileInfo(
-            path=file.rfilename, size=file.size or 0,
+            path=file.rfilename,
+            size=file.size or 0,
             url=hf_hub_url(repo_id=model_id, filename=file.rfilename),
             sha256=file.lfs.sha256 if file.lfs else None
         ) for file in repo_info.siblings
     ]
+
+    # Filter out unwanted files
     files_to_process = [
-        f for f in all_files if not any(fnmatch(f.path, pattern) for pattern in SKIP_PATTERNS)
+        f for f in all_files
+        if not any(fnmatch(f.path, pattern) for pattern in SKIP_PATTERNS)
     ]
-    skipped_count = len(all_files) - len(files_to_process)
-    safe_log('info', f"Found {len(all_files)} total files. Skipping {skipped_count} based on patterns.")
+
+    skipped = len(all_files) - len(files_to_process)
     total_size = sum(f.size for f in files_to_process)
-    safe_log('info', f"Processing {len(files_to_process)} files, total size: {total_size / (1024**3):.2f} GB")
+
+    safe_log('info', f"Found {len(all_files)} files, skipping {skipped}")
+    safe_log('info', f"Will process {len(files_to_process)} files ({total_size / (1024**3):.2f} GB)")
+
     return files_to_process
 
-def process_single_file(args):
+def process_file(args) -> Tuple[str, bool, str]:
+    """Process a single file upload"""
     file_info, uploader, progress_callback = args
-    s3_key = f"{S3_PREFIX}/{file_info.path}"
-    success, message = uploader.stream_to_s3(file_info, s3_key, progress_callback)
-    return (file_info.path, success, message)
+    model_id = os.environ['MODEL_ID']
 
-def progress_monitor(tracker: ProgressTracker, stop_event: threading.Event, files_to_process: int, completed_files: List):
-    with tqdm(total=tracker.total_size, unit='B', unit_scale=True, desc="Overall Progress") as pbar:
+    # Extract prefix from model_id
+    if "/" in model_id:
+        model_name = model_id.split("/")[1]
+        prefix = "-".join(model_name.split("-")[:3])
+    else:
+        prefix = "-".join(model_id.split("-")[:3])
+
+    s3_key = f"{prefix}/{file_info.path}"
+    success, message = uploader.upload_file_streaming(file_info, s3_key, progress_callback)
+    return file_info.path, success, message
+
+def progress_monitor(tracker: ProgressTracker, stop_event: threading.Event,
+                    total_files: int, completed_files: List):
+    """Monitor and display progress"""
+    with tqdm(total=tracker.total_size, unit='B', unit_scale=True,
+              desc="Overall Progress") as pbar:
+        last_update = 0
         while not stop_event.is_set():
             with tracker.lock:
-                processed_bytes = tracker.bytes_transferred
-            
-            pbar.update(processed_bytes - pbar.n)
-            
-            elapsed_time = time.time() - tracker.start_time
-            speed = processed_bytes / elapsed_time if elapsed_time > 0 else 0
-            pbar.set_description(f"Files: {len(completed_files)}/{files_to_process}")
-            pbar.set_postfix_str(f"{speed / 1024 / 1024:.2f} MB/s")
-            
-            if processed_bytes >= tracker.total_size: break
-            time.sleep(1)
-        if tracker.total_size > pbar.n:
-            pbar.update(tracker.total_size - pbar.n)
+                current = tracker.bytes_transferred
 
-def stream_all_files(model_id: str, token: str, max_workers: int):
-    api = HfApi()
-    s3_client = get_s3_client()
-    uploader = StreamingUploader(s3_client, S3_BUCKET, token)
+            if current > last_update:
+                pbar.update(current - last_update)
+                last_update = current
 
-    file_infos = get_file_info_list(api, model_id, token)
-    if not file_infos:
-        safe_log('warning', "No files found to process - exiting")
-        return
-    safe_log('info', f"Found {len(file_infos)} files to process after filtering")
+            speed = tracker.get_speed()
+            completed = len(completed_files)
+            pbar.set_description(f"Files: {completed}/{total_files}")
+            pbar.set_postfix_str(f"{speed / (1024**2):.2f} MB/s")
 
-    files_to_download = []
-    total_download_size = 0
-    
-    # --- NEW FEATURE: Conditionally skip the pre-flight check ---
-    if not SKIP_EXISTENCE_CHECK:
-        safe_log('info', "Checking which files need to be downloaded...")
-        for file_info in tqdm(file_infos, desc="Pre-flight check"):
-            try:
-                s3_key = f"{S3_PREFIX}/{file_info.path}"
-                s3_info = uploader.check_file_exists(s3_key)
-                should_download, reason = uploader.should_download_file(file_info, s3_info)
-                if should_download:
-                    files_to_download.append(file_info)
-                    total_download_size += file_info.size
-                    safe_log('debug', f"Will download {file_info.path}: {reason}")
-            except (BotoCoreError, ClientError) as e:
-                safe_log('warning', f"Pre-flight check failed for {file_info.path}: {e}. Assuming it needs download.")
-                files_to_download.append(file_info)
-                total_download_size += file_info.size
+            if current >= tracker.total_size:
+                break
+            time.sleep(0.5)
+
+        # Final update
+        if tracker.total_size > last_update:
+            pbar.update(tracker.total_size - last_update)
+
+def main():
+    """Main execution function"""
+    # Check mandatory environment variables
+    required_vars = ['MODEL_ID', 'HF_TOKEN', 'AWS_ACCESS_KEY_ID',
+                     'AWS_SECRET_ACCESS_KEY', 'AWS_HOST', 'S3_BUCKET']
+
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        safe_log('error', f"Missing required environment variables: {missing}")
+        sys.exit(1)
+
+    model_id = os.environ['MODEL_ID']
+    hf_token = os.environ['HF_TOKEN']
+    bucket = os.environ['S3_BUCKET']
+
+    # Extract prefix from model_id
+    if "/" in model_id:
+        model_name = model_id.split("/")[1]
+        prefix = "-".join(model_name.split("-")[:3])
     else:
-        safe_log('info', f"Skipping existence check (SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}), assuming all files need to be downloaded...")
-        files_to_download = file_infos
-        total_download_size = sum(f.size for f in file_infos)
-        safe_log('info', f"Will download all {len(files_to_download)} files")
-    
-    if not files_to_download:
-        safe_log('info', "All files are already up to date in S3. Nothing to do.")
+        prefix = "-".join(model_id.split("-")[:3])
+
+    safe_log('info', f"Model: {model_id}")
+    safe_log('info', f"Bucket: {bucket}")
+    safe_log('info', f"Prefix: {prefix}")
+
+    # Detect system resources
+    resources = detect_system_resources()
+    transfer_config = get_transfer_config(resources)
+
+    # Login to HuggingFace
+    try:
+        login(token=hf_token)
+        safe_log('info', "Logged in to HuggingFace")
+    except Exception as e:
+        safe_log('error', f"Failed to login to HuggingFace: {e}")
+        sys.exit(1)
+
+    # Get S3 client
+    try:
+        s3_client = get_s3_client()
+    except Exception as e:
+        safe_log('error', f"Failed to create S3 client: {e}")
+        sys.exit(1)
+
+    # Get file list
+    try:
+        files = get_file_list(model_id, hf_token)
+    except Exception as e:
+        safe_log('error', f"Failed to get file list: {e}")
+        sys.exit(1)
+
+    if not files:
+        safe_log('info', "No files to process")
         return
 
-    safe_log('info', f"Need to download {len(files_to_download)} files ({total_download_size / (1024**3):.2f} GB)")
-    safe_log('info', f"Starting parallel download with {max_workers} workers...")
+    # Create uploader
+    uploader = OptimizedUploader(s3_client, bucket, prefix, transfer_config, hf_token)
 
-    progress_tracker = ProgressTracker(total_size=total_download_size)
-    stop_monitor, completed_files, failed_files = threading.Event(), [], []
+    # Calculate total size
+    total_size = sum(f.size for f in files)
+    tracker = ProgressTracker(total_size=total_size)
+
+    # Start progress monitor
+    stop_event = threading.Event()
+    completed_files = []
+    failed_files = []
+
     monitor_thread = threading.Thread(
         target=progress_monitor,
-        args=(progress_tracker, stop_monitor, len(files_to_download), completed_files),
+        args=(tracker, stop_event, len(files), completed_files),
         daemon=True
     )
     monitor_thread.start()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=resources.recommended_workers) as executor:
         futures = {
-            executor.submit(process_single_file, (f, uploader, progress_tracker.update)): f
-            for f in files_to_download
+            executor.submit(process_file, (f, uploader, tracker.update)): f
+            for f in files
         }
+
         try:
             for future in as_completed(futures):
                 file_path, success, message = future.result()
@@ -453,48 +490,38 @@ def stream_all_files(model_id: str, token: str, max_workers: int):
                 else:
                     failed_files.append((file_path, message))
         except KeyboardInterrupt:
-            safe_log('warning', "Cancellation requested. Shutting down workers...")
+            safe_log('warning', "Interrupted by user, shutting down...")
             executor.shutdown(wait=False, cancel_futures=True)
-    
-    stop_monitor.set()
-    monitor_thread.join()
+            stop_event.set()
+            sys.exit(1)
 
+    # Stop progress monitor
+    stop_event.set()
+    monitor_thread.join(timeout=2)
+
+    # Print summary
     safe_log('info', "\n" + "="*50)
-    safe_log('info', "FINAL SUMMARY")
+    safe_log('info', "TRANSFER SUMMARY")
     safe_log('info', "="*50)
-    safe_log('info', f"Total files to download: {len(files_to_download)}")
-    safe_log('info', f"Successful uploads: {len(completed_files)}")
-    safe_log('info', f"Failed uploads: {len(failed_files)}")
+    safe_log('info', f"Total files: {len(files)}")
+    safe_log('info', f"Successful: {len(completed_files)}")
+    safe_log('info', f"Failed: {len(failed_files)}")
+
     if failed_files:
-        safe_log('error', "--- FAILED FILES ---")
-        for path, msg in failed_files:
-            safe_log('error', f"  - {path}: {msg}")
+        safe_log('error', "Failed files:")
+        for path, error in failed_files[:10]:  # Show first 10 failures
+            safe_log('error', f"  - {path}: {error}")
+        if len(failed_files) > 10:
+            safe_log('error', f"  ... and {len(failed_files) - 10} more")
 
-if __name__ == "__main__":
-    # Log environment configuration
-    safe_log('info', f"Environment flags: SKIP_EXISTENCE_CHECK={SKIP_EXISTENCE_CHECK}, FORCE_REDOWNLOAD={FORCE_REDOWNLOAD}")
-    safe_log('info', f"Model: {model_id}, Bucket: {S3_BUCKET}, Prefix: {S3_PREFIX}")
-
-    if not all([model_id, huggingface_token, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_HOST, S3_BUCKET]):
-        logging.error("Missing required environment variables.")
-        logging.error(f"model_id={model_id}, HF_TOKEN={'set' if huggingface_token else 'missing'}")
-        logging.error(f"AWS_ACCESS_KEY_ID={'set' if AWS_ACCESS_KEY_ID else 'missing'}")
-        logging.error(f"AWS_SECRET_ACCESS_KEY={'set' if AWS_SECRET_ACCESS_KEY else 'missing'}")
-        logging.error(f"AWS_HOST={AWS_HOST}, S3_BUCKET={S3_BUCKET}")
-        exit(1)
-
-    max_workers = detect_resources()
-    
-    try:
-        login(token=huggingface_token)
-        safe_log('info', "Logged in to Hugging Face")
-        stream_all_files(model_id, huggingface_token, max_workers)
-    except KeyboardInterrupt:
-        safe_log('info', "Process interrupted by user.")
-    except Exception as e:
-        safe_log('error', f"A fatal error occurred: {e}")
-        import traceback
-        safe_log('error', f"Traceback: {traceback.format_exc()}")
-        exit(1)  # Exit with error code
+    # Calculate final speed
+    elapsed = time.time() - tracker.start_time
+    if elapsed > 0:
+        avg_speed = tracker.bytes_transferred / elapsed
+        safe_log('info', f"Average speed: {avg_speed / (1024**2):.2f} MB/s")
+        safe_log('info', f"Total time: {elapsed:.2f} seconds")
 
     safe_log('info', "Transfer complete!")
+
+if __name__ == "__main__":
+    main()
