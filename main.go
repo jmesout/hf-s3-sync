@@ -114,10 +114,6 @@ func main() {
 
 	job := hfdownloader.Job{
 		Repo: config.ModelID,
-		// Revision:  "main",
-		// IsDataset: false,
-		// Filters:   []string{"q4_0"},
-		// AppendFilterSubdir: true, // optional
 	}
 
 	// Option 1: Save to local storage first, then upload to S3
@@ -154,9 +150,8 @@ func main() {
 				// Upload to S3 after file is downloaded (run in goroutine to avoid blocking)
 				if !useLocalStorage {
 					go func(path string) {
-						// Generate S3 object key (remove local path prefix)
+						// Generate S3 object key and local file path
 						objectPath := fmt.Sprintf("%s/%s/%s", outputDir, config.ModelID, path)
-						// Create folder structure: org-name/model-name/file-path
 						orgName := extractOrgName(config.ModelID)
 						objectName := fmt.Sprintf("%s/%s", orgName, path)
 
