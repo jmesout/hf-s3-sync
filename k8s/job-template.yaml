@@ -1,0 +1,59 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hf-s3-sync-MODEL_ID_PLACEHOLDER
+  namespace: default
+  labels:
+    app: hf-s3-sync
+    model: MODEL_ID_PLACEHOLDER
+spec:
+  backoffLimit: 2
+  completionMode: NonIndexed
+  completions: 1
+  manualSelector: false
+  parallelism: 1
+  podReplacementPolicy: TerminatingOrFailed
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app: hf-s3-sync
+        model: MODEL_ID_PLACEHOLDER
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - env:
+            - name: MODEL_ID
+              value: MODEL_ID_PLACEHOLDER
+            - name: S3_BUCKET
+              value: model-cache
+            - name: AWS_HOST
+              value: objectstore.lon1.civo.com
+            - name: USE_LOCAL_STORAGE
+              value: "false"
+          envFrom:
+            - secretRef:
+                name: hf-token-secret
+                optional: false
+            - secretRef:
+                name: s3-credentials
+                optional: false
+          image: <image-name>
+          imagePullPolicy: Always
+          name: hf-s3-streamer
+          resources:
+            limits:
+              cpu: "4"
+              memory: 8Gi
+            requests:
+              cpu: "2"
+              memory: 4Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: true
+      restartPolicy: OnFailure
+      schedulerName: default-scheduler
+      securityContext: {}
+      shareProcessNamespace: false
+      terminationGracePeriodSeconds: 30

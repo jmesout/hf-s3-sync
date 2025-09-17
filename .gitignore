@@ -39,4 +39,4 @@ credentials.json
 *.key
 *.crt
 
-k8s/*.yaml
+k8s/job.yaml
