@@ -1,19 +1,20 @@
-# Use Python slim image for smaller size
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
 
-# Set environment variables for best practices
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+FROM golang:1.25-alpine
 
-# Set working directory
+# Set destination for COPY
 WORKDIR /app
 
-# Copy requirements and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Download Go modules
+COPY go.mod go.sum ./
+RUN go mod download
 
-# Copy the application script
-COPY hf_to_s3_streaming.py .
+# Copy the source code. Note the slash at the end, as explained in
+# https://docs.docker.com/engine/reference/builder/#copy
+COPY *.go ./
 
-# Run the streaming script
-CMD ["python", "hf_to_s3_streaming.py"]
+# Build
+RUN CGO_ENABLED=0 GOOS=linux go build -o /hfsyncs3
+
+# Run
+CMD ["/hfsyncs3"]
