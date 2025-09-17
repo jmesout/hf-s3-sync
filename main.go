@@ -147,24 +147,22 @@ func main() {
 			} else {
 				log.Printf("done: %s", ev.Path)
 
-				// Upload to S3 after file is downloaded (run in goroutine to avoid blocking)
+				// Upload to S3 after file is downloaded
 				if !useLocalStorage {
-					go func(path string) {
-						// Generate S3 object key and local file path
-						objectPath := fmt.Sprintf("%s/%s/%s", outputDir, config.ModelID, path)
-						orgName := extractOrgName(config.ModelID)
-						objectName := fmt.Sprintf("%s/%s", orgName, path)
+					// Generate S3 object key and local file path
+					objectPath := fmt.Sprintf("%s/%s/%s", outputDir, config.ModelID, ev.Path)
+					orgName := extractOrgName(config.ModelID)
+					objectName := fmt.Sprintf("%s/%s", orgName, ev.Path)
 
-						// Upload to S3
-						if err := uploadToS3(s3Client, config.S3BucketName, objectName, objectPath); err != nil {
-							log.Printf("Failed to upload %s to S3: %v", objectPath, err)
-						} else {
-							// Remove local file after successful upload to save space
-							if err := os.Remove(objectPath); err != nil {
-								log.Printf("Failed to remove local file %s: %v", path, err)
-							}
+					// Upload to S3
+					if err := uploadToS3(s3Client, config.S3BucketName, objectName, objectPath); err != nil {
+						log.Printf("Failed to upload %s to S3: %v", objectPath, err)
+					} else {
+						// Remove local file after successful upload to save space
+						if err := os.Remove(objectPath); err != nil {
+							log.Printf("Failed to remove local file %s: %v", ev.Path, err)
 						}
-					}(ev.Path)
+					}
 				}
 			}
 		case "file_progress":
